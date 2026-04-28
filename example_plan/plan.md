@@ -18,17 +18,17 @@ boot it with npm run dev so i can poke at it. use .tmp folder for this project.
 
 ### codex
 
-plain text is killing me, i want markdown. render it nicely when im not
+For our notepad app in the .tmp folder: plain text is killing me, i want markdown. render it nicely when im not
 editing, let me toggle back to edit mode to change it. headings, bold,
 lists, code blocks, links, the usual.
 
 ### claude
 
-i want to find notes fast. add search. should feel instant.
+For our notepad app in the .tmp folder: i want to find notes fast. add search. should feel instant.
 
 ### gemini
 
-add tags to notes. i want to type #something in the note and have it become
+For our notepad app in the .tmp folder: add tags to notes. i want to type #something in the note and have it become
 a tag, and i want to filter the sidebar by tag.
 
 --------
@@ -37,15 +37,15 @@ a tag, and i want to filter the sidebar by tag.
 
 ### codex
 
-i want to export a note as a .md file download, and import .md files back in
+For our notepad app in the .tmp folder: i want to export a note as a .md file download, and import .md files back in
 as new notes. drag and drop import would be sick.
 
 ### claude
 
-let me pin notes to the top of the list. pinned ones stay up there, sorted
+For our notepad app in the .tmp folder: let me pin notes to the top of the list. pinned ones stay up there, sorted
 by most recently edited under that.
 
 ### gemini
 
-dark mode is cool but sometimes i want light. add a theme toggle that
+For our notepad app in the .tmp folder: dark mode is cool but sometimes i want light. add a theme toggle that
 remembers my choice.
