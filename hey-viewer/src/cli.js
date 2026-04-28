@@ -7,8 +7,8 @@ import React, { useEffect, useState } from "react";
 import { Box, Text, render, useApp, useInput, useWindowSize } from "ink";
 import {
   analyzeMarkdown,
-  buildEvent,
   parseArgs,
+  splitLines,
   summarizeSnapshot,
 } from "./model.js";
 
@@ -16,6 +16,7 @@ const h = React.createElement;
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const packageDir = path.resolve(__dirname, "..");
+const oneHourMs = 60 * 60 * 1000;
 
 function helpText() {
   return [
@@ -29,14 +30,15 @@ function helpText() {
     "",
     "Options:",
     "  -f, --file <path>       Markdown file to watch. Defaults to ../hey.md.",
-    "  --max-events <number>   Keep this many in-session changes. Default: 240.",
     "  --snapshot, --once      Print a one-time text summary and exit.",
     "  -h, --help              Show this help.",
     "",
     "Keys:",
-    "  Up/Down or Left/Right   Scroll the change log.",
-    "  Enter or Space          Expand/collapse selected change details on the right.",
-    "  Home/End                Jump to newest/oldest change.",
+    "  Up/Down                 Scroll hey.md one line.",
+    "  j/k                     Scroll hey.md one line.",
+    "  PageUp/PageDown         Scroll hey.md one page.",
+    "  Left/Right or b/f       Scroll hey.md one page.",
+    "  Home/End or g/G         Jump to top/bottom.",
     "  q or Ctrl+C             Quit.",
   ].join("\n");
 }
@@ -52,6 +54,21 @@ function formatTime(value) {
   }).format(date);
 }
 
+function formatShortTime(value) {
+  if (!value) return "never";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return new Intl.DateTimeFormat(undefined, {
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(date);
+}
+
+function compactBytes(bytes) {
+  if (bytes < 1024) return `${bytes} B`;
+  return `${(bytes / 1024).toFixed(1)} KB`;
+}
+
 function truncate(value, width) {
   const text = String(value ?? "");
   if (width <= 1) return "";
@@ -59,17 +76,8 @@ function truncate(value, width) {
   return `${text.slice(0, Math.max(1, width - 3))}...`;
 }
 
-function joinList(values, fallback = "none") {
-  return values?.length ? values.join(", ") : fallback;
-}
-
-function plural(count, singular, pluralValue = `${singular}s`) {
-  return `${count} ${count === 1 ? singular : pluralValue}`;
-}
-
-function compactBytes(bytes) {
-  if (bytes < 1024) return `${bytes} B`;
-  return `${(bytes / 1024).toFixed(1)} KB`;
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, value));
 }
 
 async function readTarget(targetPath) {
@@ -81,16 +89,11 @@ function makeInitialState() {
   return {
     text: "",
     analysis: analyzeMarkdown(""),
-    timeline: [],
     revision: 0,
     updatedAt: null,
     mtimeMs: 0,
     error: null,
   };
-}
-
-function clamp(value, min, max) {
-  return Math.max(min, Math.min(max, value));
 }
 
 function Panel({ title, titleRight = "", children, width, height, flexGrow = 1, marginRight = 0, marginBottom = 0 }) {
@@ -124,154 +127,174 @@ function Panel({ title, titleRight = "", children, width, height, flexGrow = 1, 
   );
 }
 
-function ChangeLog({ timeline, selectedIndex, width, bodyRows }) {
-  if (timeline.length === 0) {
-    return h(Box, { paddingY: 1 }, h(Text, { color: "gray" }, "Waiting for the first file read."));
+function parseNoteTimestamp(timestamp) {
+  if (!timestamp) return null;
+  const normalized = timestamp
+    .replace(/\s+EDT$/i, " -0400")
+    .replace(/\s+EST$/i, " -0500")
+    .replace(/\s+CDT$/i, " -0500")
+    .replace(/\s+CST$/i, " -0600")
+    .replace(/\s+MDT$/i, " -0600")
+    .replace(/\s+MST$/i, " -0700")
+    .replace(/\s+PDT$/i, " -0700")
+    .replace(/\s+PST$/i, " -0800")
+    .replace(/\s+UTC$/i, " +0000");
+  const time = Date.parse(normalized);
+  return Number.isNaN(time) ? null : time;
+}
+
+function ageLabel(timestamp, now) {
+  const time = parseNoteTimestamp(timestamp);
+  if (!time) return "unknown age";
+  const delta = Math.max(0, now - time);
+  if (delta < 60 * 1000) return "now";
+  if (delta < oneHourMs) return `${Math.floor(delta / 60000)}m`;
+  if (delta < 24 * oneHourMs) return `${Math.floor(delta / oneHourMs)}h`;
+  return `${Math.floor(delta / (24 * oneHourMs))}d`;
+}
+
+function coordinationSummary(notes, now = Date.now()) {
+  const active = [];
+  const older = [];
+  const activeAgents = new Set();
+  const olderAgents = new Set();
+
+  for (const note of notes) {
+    const time = parseNoteTimestamp(note.timestamp);
+    const isRecent = time !== null && now - time < oneHourMs;
+    if (isRecent) {
+      active.push(note);
+      activeAgents.add(note.actor);
+    } else {
+      older.push(note);
+      olderAgents.add(note.actor);
+    }
   }
 
-  const visibleCount = Math.max(1, Math.floor(Math.max(2, bodyRows - 2) / 2));
-  const maxStart = Math.max(0, timeline.length - visibleCount);
-  const start = clamp(selectedIndex - Math.floor(visibleCount / 3), 0, maxStart);
-  const visible = timeline.slice(start, start + visibleCount);
-  const rows = [];
+  return { active, older, activeAgents, olderAgents };
+}
 
-  if (start > 0) {
-    rows.push(h(Text, { key: "newer", color: "gray" }, `${start} newer entries above`));
+function inlineMarkdown(text, color = undefined) {
+  const parts = [];
+  const pattern = /(`[^`]+`|\*\*[^*]+\*\*)/g;
+  let cursor = 0;
+  let index = 0;
+
+  for (const match of text.matchAll(pattern)) {
+    if (match.index > cursor) {
+      parts.push(h(Text, { key: `t-${index}`, color }, text.slice(cursor, match.index)));
+      index += 1;
+    }
+
+    const token = match[0];
+    if (token.startsWith("`")) {
+      parts.push(h(Text, { key: `c-${index}`, color: "yellow" }, token));
+    } else {
+      parts.push(h(Text, { key: `b-${index}`, bold: true, color }, token));
+    }
+    index += 1;
+    cursor = match.index + token.length;
   }
 
-  for (const [offset, event] of visible.entries()) {
-    const index = start + offset;
-    const selected = index === selectedIndex;
-    const prefix = selected ? ">" : " ";
-    const count = `+${event.additions.length}/-${event.deletions.length}`;
-    const section = joinList(event.changedSections, event.type === "snapshot" ? "snapshot" : "unknown");
+  if (cursor < text.length) {
+    parts.push(h(Text, { key: `t-${index}`, color }, text.slice(cursor)));
+  }
+
+  return parts.length ? parts : [h(Text, { key: "empty", color }, "")];
+}
+
+function MarkdownLine({ line, width }) {
+  if (line.length === 0) return h(Text, null, " ");
+
+  const text = truncate(line, width);
+  const trimmed = text.trim();
+  const heading = text.match(/^(#{1,6})(\s+.*)$/);
+  if (heading) {
+    return h(
+      Text,
+      null,
+      h(Text, { color: "gray" }, heading[1]),
+      h(Text, { color: "cyan", bold: true }, heading[2]),
+    );
+  }
+
+  let color;
+  let bold = false;
+  if (/^\s*[-*]\s+/.test(text) || /^\s*\d+\.\s+/.test(text)) {
+    color = "green";
+  } else if (/^\s*>/.test(text)) {
+    color = "yellow";
+  } else if (/^\s*(```|---|\*\*\*)/.test(text)) {
+    color = "gray";
+  } else if (/^No active notes\.?$/i.test(trimmed)) {
+    color = "gray";
+  }
+
+  return h(
+    Text,
+    { color, bold },
+    ...inlineMarkdown(text, color),
+  );
+}
+
+function MarkdownViewer({ text, scrollOffset, width, bodyRows }) {
+  const lines = splitLines(text);
+  if (lines.length === 0) {
+    return h(Text, { color: "gray" }, "Waiting for file read.");
+  }
+
+  const visible = lines.slice(scrollOffset, scrollOffset + bodyRows);
+  return h(
+    Box,
+    { flexDirection: "column" },
+    ...visible.map((line, index) =>
+      h(MarkdownLine, {
+        key: `${scrollOffset + index}-${line}`,
+        line,
+        width,
+      }),
+    ),
+  );
+}
+
+function AgentList({ title, notes, width, now, keyPrefix }) {
+  const rows = [h(Text, { key: `${keyPrefix}-title`, color: "cyan", bold: true }, title)];
+  if (notes.length === 0) {
+    rows.push(h(Text, { key: `${keyPrefix}-none`, color: "gray" }, "none"));
+    return rows;
+  }
+
+  for (const note of notes.slice(0, 5)) {
     rows.push(
       h(
         Text,
-        {
-          key: `${event.id}-headline`,
-          color: selected ? "black" : undefined,
-          backgroundColor: selected ? "cyan" : undefined,
-        },
-        `${prefix} ${formatTime(event.at)} ${count} ${truncate(event.headline, Math.max(24, width - 24))}`,
-      ),
-    );
-    rows.push(
-      h(
-        Text,
-        { key: `${event.id}-meta`, color: "gray" },
-        `  ${truncate(section, Math.max(12, width - 16))} | refs: ${truncate(joinList(event.touchedTokens), Math.max(10, width - 26))}`,
+        { key: `${keyPrefix}-${note.id}` },
+        h(Text, { color: "green", bold: true }, note.actor),
+        h(Text, { color: "gray" }, ` ${ageLabel(note.timestamp, now)} `),
+        truncate(note.message, width - note.actor.length - 8),
       ),
     );
   }
-
-  const older = timeline.length - (start + visible.length);
-  if (older > 0) {
-    rows.push(h(Text, { key: "older", color: "gray" }, `${older} older entries below`));
-  }
-
-  return h(Box, { flexDirection: "column" }, ...rows);
-}
-
-function ActiveSessions({ notes, width, limit }) {
-  if (notes.length === 0) return [h(Text, { key: "none", color: "gray" }, "No active sessions.")];
-
-  const rows = [];
-  for (const note of notes.slice(0, limit)) {
-    rows.push(h(Text, { key: `${note.id}-actor` }, h(Text, { color: "green", bold: true }, note.actor), h(Text, { color: "gray" }, ` line ${note.line}`)));
-    rows.push(h(Text, { key: `${note.id}-message` }, truncate(note.message, width - 4)));
-  }
-  if (notes.length > limit) rows.push(h(Text, { key: "more", color: "gray" }, `+${notes.length - limit} more sessions`));
+  if (notes.length > 5) rows.push(h(Text, { key: `${keyPrefix}-more`, color: "gray" }, `+${notes.length - 5} more`));
   return rows;
 }
 
-function DiffRows({ event, expanded, width, limit }) {
-  if (!expanded) {
-    return [h(Text, { key: "hint", color: "gray" }, "Press Enter to show changed lines.")];
-  }
-
-  const rows = [];
-  for (const line of event.additions.slice(0, limit)) {
-    rows.push(h(Text, { key: `a-${line.line}-${line.text}`, color: "green" }, `+${line.line}: ${truncate(line.text || " ", width - 8)}`));
-  }
-  for (const line of event.deletions.slice(0, limit)) {
-    rows.push(h(Text, { key: `d-${line.line}-${line.text}`, color: "red" }, `-${line.line}: ${truncate(line.text || " ", width - 8)}`));
-  }
-  if (rows.length === 0) rows.push(h(Text, { key: "empty", color: "gray" }, "No changed lines in this entry."));
-  const hidden = event.additions.length + event.deletions.length - rows.length;
-  if (hidden > 0) rows.push(h(Text, { key: "hidden", color: "gray" }, `+${hidden} more changed lines hidden`));
-  return rows;
-}
-
-function SummaryPane({ state, selectedEvent, expanded, width, bodyRows }) {
-  const stats = state.analysis.stats;
-  const event = selectedEvent;
-  const opened = event?.noteChanges.opened.map((note) => `${note.actor}: ${note.message}`) || [];
-  const closed = event?.noteChanges.closed.map((note) => `${note.actor}: ${note.message}`) || [];
-  const sections = state.analysis.sections.slice(0, 5).map((section) => `${section.title}(${section.lines})`);
-  const sessionLimit = Math.max(1, Math.min(4, Math.floor(bodyRows / 8)));
-  const diffLimit = Math.max(2, Math.min(8, bodyRows - 14));
-
+function SummaryPane({ analysis, updatedAt, revision, width, bodyRows }) {
+  const now = Date.now();
+  const summary = coordinationSummary(analysis.activeNotes, now);
   const rows = [
-    h(
-      Text,
-      { key: "counts" },
-      h(Text, { color: "gray" }, "entries "),
-      h(Text, { color: "cyan", bold: true }, String(state.timeline.length)),
-      h(Text, { color: "gray" }, " | active "),
-      h(Text, { color: stats.activeNotes ? "green" : "gray", bold: true }, String(stats.activeNotes)),
-    ),
-    h(
-      Text,
-      { key: "file-counts" },
-      h(Text, { color: "gray" }, "actors "),
-      h(Text, { color: stats.actors ? "cyan" : "gray", bold: true }, String(stats.actors)),
-      h(Text, { color: "gray" }, " | lines "),
-      h(Text, { bold: true }, String(stats.lines)),
-    ),
-    h(
-      Text,
-      { key: "shape-counts" },
-      h(Text, { color: "gray" }, "size "),
-      h(Text, { bold: true }, compactBytes(stats.bytes)),
-      h(Text, { color: "gray" }, " | sections "),
-      h(Text, { bold: true }, String(stats.headings)),
-    ),
+    h(Text, { key: "active" }, "active <1h: ", h(Text, { color: summary.active.length ? "green" : "gray", bold: true }, String(summary.active.length))),
+    h(Text, { key: "older" }, "older 1h+: ", h(Text, { color: summary.older.length ? "yellow" : "gray", bold: true }, String(summary.older.length))),
+    h(Text, { key: "agents", color: "gray" }, `agents ${summary.activeAgents.size}/${summary.olderAgents.size}`),
+    h(Text, { key: "file", color: "gray" }, `${analysis.stats.lines} lines | ${compactBytes(analysis.stats.bytes)}`),
+    h(Text, { key: "updated", color: "gray" }, `rev ${revision} | ${formatShortTime(updatedAt)}`),
     h(Text, { key: "spacer-1" }, ""),
-    h(Text, { key: "sessions-title", color: "cyan", bold: true }, "Active Sessions"),
-    ...ActiveSessions({ notes: state.analysis.activeNotes, width, limit: sessionLimit }),
+    ...AgentList({ title: "Active", notes: summary.active, width, now, keyPrefix: "active" }),
     h(Text, { key: "spacer-2" }, ""),
-    h(Text, { key: "selected-title", color: "cyan", bold: true }, "Selected Entry"),
+    ...AgentList({ title: "Older", notes: summary.older, width, now, keyPrefix: "older" }),
   ];
 
-  if (!event) {
-    rows.push(h(Text, { key: "no-entry", color: "gray" }, "No change selected."));
-  } else {
-    rows.push(h(Text, { key: "headline", bold: true }, truncate(event.headline, width - 4)));
-    rows.push(h(Text, { key: "meta", color: "gray" }, `rev ${event.revision} | ${formatTime(event.at)} | ${plural(event.additions.length, "add")} | ${plural(event.deletions.length, "delete")}`));
-    rows.push(h(Text, { key: "selected-sections" }, "sections: ", h(Text, { color: "cyan" }, truncate(joinList(event.changedSections), width - 14))));
-    if (event.addedTokens.length) {
-      rows.push(h(Text, { key: "refs-add" }, "added refs: ", h(Text, { color: "green" }, truncate(joinList(event.addedTokens), width - 15))));
-    }
-    if (event.deletedTokens.length) {
-      rows.push(h(Text, { key: "refs-del" }, "deleted refs: ", h(Text, { color: "red" }, truncate(joinList(event.deletedTokens), width - 17))));
-    }
-    if (opened.length) {
-      rows.push(h(Text, { key: "opened" }, "opened: ", h(Text, { color: "green" }, truncate(joinList(opened), width - 12))));
-    }
-    if (closed.length) {
-      rows.push(h(Text, { key: "closed" }, "closed: ", h(Text, { color: "red" }, truncate(joinList(closed), width - 12))));
-    }
-    rows.push(h(Text, { key: "spacer-3" }, ""));
-    rows.push(h(Text, { key: "diff-title", color: "cyan", bold: true }, expanded ? "Changed Lines" : "Changed Lines Hidden"));
-    rows.push(...DiffRows({ event, expanded, width, limit: diffLimit }));
-  }
-
-  rows.push(h(Text, { key: "spacer-4" }, ""));
-  rows.push(h(Text, { key: "shape", color: "gray" }, `shape: ${truncate(joinList(sections), width - 8)}`));
-  rows.push(h(Text, { key: "keys", color: "gray" }, "keys: arrows scroll | enter details | q quits"));
-
-  return h(Box, { flexDirection: "column" }, ...rows.slice(0, Math.max(1, bodyRows)));
+  return h(Box, { flexDirection: "column" }, ...rows.slice(0, bodyRows));
 }
 
 function Footer({ error, targetPath, cwd }) {
@@ -281,23 +304,19 @@ function Footer({ error, targetPath, cwd }) {
   return h(Text, { color: "gray" }, `watching ${path.relative(cwd, targetPath) || targetPath}`);
 }
 
-function App({ targetPath, maxEvents }) {
+function App({ targetPath }) {
   const { exit } = useApp();
   const { columns, rows } = useWindowSize();
   const terminalColumns = columns || 100;
   const terminalRows = rows || 30;
   const stacked = terminalColumns < 76;
-  const rightWidth = stacked ? terminalColumns : clamp(Math.floor(terminalColumns * 0.34), 30, 48);
-  const leftWidth = stacked ? terminalColumns : Math.max(34, terminalColumns - rightWidth - 1);
+  const rightWidth = stacked ? terminalColumns : clamp(Math.floor(terminalColumns * 0.3), 28, 40);
+  const leftWidth = stacked ? terminalColumns : Math.max(40, terminalColumns - rightWidth - 1);
   const bodyHeight = Math.max(16, terminalRows - 5);
-  const logBodyRows = stacked ? Math.max(8, Math.floor(bodyHeight * 0.48)) : bodyHeight - 3;
-  const summaryBodyRows = stacked ? Math.max(10, bodyHeight - logBodyRows - 1) : bodyHeight - 3;
-  const [selectedIndex, setSelectedIndex] = useState(0);
-  const [expandedIds, setExpandedIds] = useState(() => new Set());
+  const leftBodyRows = stacked ? Math.max(8, Math.floor(bodyHeight * 0.58)) : bodyHeight - 3;
+  const rightBodyRows = stacked ? Math.max(8, bodyHeight - leftBodyRows - 1) : bodyHeight - 3;
+  const [scrollOffset, setScrollOffset] = useState(0);
   const [state, setState] = useState(makeInitialState);
-
-  const selectedEvent = state.timeline[selectedIndex] || null;
-  const selectedExpanded = selectedEvent ? expandedIds.has(selectedEvent.id) : false;
 
   useInput((input, key) => {
     if (input === "q" || key.escape || (key.ctrl && input === "c")) {
@@ -305,26 +324,19 @@ function App({ targetPath, maxEvents }) {
       return;
     }
 
-    if (key.upArrow || key.leftArrow) {
-      setSelectedIndex((current) => Math.max(0, current - 1));
-    } else if (key.downArrow || key.rightArrow) {
-      setSelectedIndex((current) => Math.min(Math.max(0, state.timeline.length - 1), current + 1));
-    } else if (key.home) {
-      setSelectedIndex(0);
-    } else if (key.end) {
-      setSelectedIndex(Math.max(0, state.timeline.length - 1));
-    } else if (key.return || input === " ") {
-      const event = state.timeline[selectedIndex];
-      if (!event) return;
-      setExpandedIds((current) => {
-        const next = new Set(current);
-        if (next.has(event.id)) {
-          next.delete(event.id);
-        } else {
-          next.add(event.id);
-        }
-        return next;
-      });
+    const maxOffset = Math.max(0, state.analysis.stats.lines - leftBodyRows);
+    if (key.upArrow || input === "k") {
+      setScrollOffset((current) => clamp(current - 1, 0, maxOffset));
+    } else if (key.downArrow || input === "j") {
+      setScrollOffset((current) => clamp(current + 1, 0, maxOffset));
+    } else if (key.leftArrow || key.pageUp || input === "b") {
+      setScrollOffset((current) => clamp(current - leftBodyRows, 0, maxOffset));
+    } else if (key.rightArrow || key.pageDown || input === " " || input === "f") {
+      setScrollOffset((current) => clamp(current + leftBodyRows, 0, maxOffset));
+    } else if (key.home || input === "g") {
+      setScrollOffset(0);
+    } else if (key.end || input === "G") {
+      setScrollOffset(maxOffset);
     }
   });
 
@@ -344,25 +356,17 @@ function App({ targetPath, maxEvents }) {
             return { ...current, mtimeMs: next.mtimeMs, error: null };
           }
 
-          const previousAnalysis = current.analysis;
-          const nextAnalysis = analyzeMarkdown(next.text);
-          const revision = current.revision + 1;
-          const event = buildEvent(type, current.text, next.text, previousAnalysis, nextAnalysis, revision);
           return {
             text: next.text,
-            analysis: nextAnalysis,
-            timeline: [event, ...current.timeline].slice(0, maxEvents),
-            revision,
+            analysis: analyzeMarkdown(next.text),
+            revision: current.revision + 1,
             updatedAt: new Date().toISOString(),
             mtimeMs: next.mtimeMs,
             error: null,
           };
         });
-        setSelectedIndex(0);
       } catch (error) {
-        if (!disposed) {
-          setState((current) => ({ ...current, error }));
-        }
+        if (!disposed) setState((current) => ({ ...current, error }));
       }
     }
 
@@ -383,9 +387,7 @@ function App({ targetPath, maxEvents }) {
       try {
         const fileStat = await stat(targetPath);
         setState((current) => {
-          if (fileStat.mtimeMs !== current.mtimeMs) {
-            scheduleRefresh();
-          }
+          if (fileStat.mtimeMs !== current.mtimeMs) scheduleRefresh();
           return current;
         });
       } catch (error) {
@@ -399,17 +401,20 @@ function App({ targetPath, maxEvents }) {
       clearInterval(pollTimer);
       watcher?.close();
     };
-  }, [targetPath, maxEvents]);
+  }, [targetPath]);
 
   useEffect(() => {
-    setSelectedIndex((current) => Math.min(current, Math.max(0, state.timeline.length - 1)));
-  }, [state.timeline.length]);
+    const maxOffset = Math.max(0, state.analysis.stats.lines - leftBodyRows);
+    setScrollOffset((current) => clamp(current, 0, maxOffset));
+  }, [state.analysis.stats.lines, leftBodyRows]);
 
-  const stats = state.analysis.stats;
   const status = state.error ? "error" : "live";
   const headerColor = state.error ? "red" : "green";
   const relativeTarget = path.relative(process.cwd(), targetPath) || targetPath;
-  const headerRight = `${status} | rev ${state.revision} | entries ${state.timeline.length} | updated ${formatTime(state.updatedAt)}`;
+  const maxOffset = Math.max(0, state.analysis.stats.lines - leftBodyRows);
+  const position = state.analysis.stats.lines
+    ? `${scrollOffset + 1}-${Math.min(state.analysis.stats.lines, scrollOffset + leftBodyRows)}/${state.analysis.stats.lines}`
+    : "0/0";
 
   return h(
     Box,
@@ -418,35 +423,41 @@ function App({ targetPath, maxEvents }) {
       Box,
       { justifyContent: "space-between" },
       h(Text, { bold: true, color: "cyan" }, "HeyViewer"),
-      h(Text, { color: headerColor }, headerRight),
+      h(Text, { color: headerColor }, `${status} | ${formatTime(state.updatedAt)}`),
     ),
-    h(Text, { color: "gray" }, `${relativeTarget} | ${stats.activeNotes} active | ${stats.actors} actors | ${stats.lines} lines`),
+    h(Text, { color: "gray" }, `${relativeTarget} | scroll ${position} | j/k page: f/b`),
     h(
       Box,
       { marginTop: 1, flexDirection: stacked ? "column" : "row" },
       h(
         Panel,
         {
-          title: "Change Log",
-          titleRight: `${state.timeline.length ? selectedIndex + 1 : 0}/${state.timeline.length}`,
+          title: "hey.md",
+          titleRight: maxOffset > 0 ? position : "",
           width: leftWidth,
-          height: stacked ? logBodyRows + 3 : bodyHeight,
+          height: stacked ? leftBodyRows + 3 : bodyHeight,
           flexGrow: stacked ? 1 : 2,
           marginRight: stacked ? 0 : 1,
           marginBottom: stacked ? 1 : 0,
         },
-        h(ChangeLog, { timeline: state.timeline, selectedIndex, width: leftWidth - 4, bodyRows: logBodyRows }),
+        h(MarkdownViewer, { text: state.text, scrollOffset, width: leftWidth - 4, bodyRows: leftBodyRows }),
       ),
       h(
         Panel,
         {
-          title: "Summary",
-          titleRight: selectedExpanded ? "expanded" : "fixed",
+          title: "Coordination",
+          titleRight: "simple",
           width: rightWidth,
-          height: stacked ? summaryBodyRows + 3 : bodyHeight,
+          height: stacked ? rightBodyRows + 3 : bodyHeight,
           flexGrow: 1,
         },
-        h(SummaryPane, { state, selectedEvent, expanded: selectedExpanded, width: rightWidth - 4, bodyRows: summaryBodyRows }),
+        h(SummaryPane, {
+          analysis: state.analysis,
+          updatedAt: state.updatedAt,
+          revision: state.revision,
+          width: rightWidth - 4,
+          bodyRows: rightBodyRows,
+        }),
       ),
     ),
     h(Box, { marginTop: 1 }, h(Footer, { error: state.error, targetPath, cwd: process.cwd() })),
@@ -484,7 +495,7 @@ async function main() {
     return;
   }
 
-  render(h(App, { targetPath: options.targetPath, maxEvents: options.maxEvents }));
+  render(h(App, { targetPath: options.targetPath }));
 }
 
 main().catch((error) => {

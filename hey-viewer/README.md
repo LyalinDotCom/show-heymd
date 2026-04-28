@@ -11,13 +11,14 @@ npm install
 npm start
 ```
 
-By default it watches `../hey.md`, keeps all change history in process memory only, and exits without writing any long-term state. The main view is a scrolling change log on the left with a fixed summary/details pane on the right.
+By default it watches `../hey.md`, keeps state in process memory only, and exits without writing any long-term state. The main view shows `hey.md` directly on the left with light Markdown coloring, and a simple coordination summary on the right.
 
 ## Keys
 
-- `Up`/`Down` or `Left`/`Right`: scroll the change log.
-- `Enter` or `Space`: expand or collapse changed-line detail for the selected entry.
-- `Home`/`End`: jump to newest or oldest change.
+- `Up`/`Down`: scroll `hey.md` one line.
+- `j`/`k`: scroll `hey.md` one line.
+- `PageUp`/`PageDown`, `b`/`f`, Space, or `Left`/`Right`: scroll one page.
+- `Home`/`End` or `g`/`G`: jump to top or bottom.
 - `q` or `Ctrl+C`: quit.
 
 ## Options
@@ -25,8 +26,7 @@ By default it watches `../hey.md`, keeps all change history in process memory on
 ```sh
 npm start -- --file ../hey.md
 npm start -- ./path/to/hey.md
-npm start -- --max-events 80
 npm run snapshot
 ```
 
-The TUI shows active sessions, a live added/deleted line log, changed sections, backtick references, session open/close movement, and summary counts.
+The summary counts coordination tasks from the `## Active Notes` section. Notes timestamped within the last hour are active; notes one hour or older are older.
