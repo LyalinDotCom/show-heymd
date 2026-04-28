@@ -10,7 +10,10 @@ main area is just a big textarea editor for the selected note. new note
 button up top. notes persist in localStorage so they survive refresh.
 clicking a note in the sidebar loads it in the editor. typing updates it
 live. that's it, keep it clean and minimal, monospace feels right for this.
-boot it with npm run dev so i can poke at it. use .tmp folder for this project.
+boot it with npm run dev so i can poke at it. 
+
+1. use .tmp folder for this project.
+2. don't run the website you make ill run the dev server and test it myself, just make sure built/lint/tests pass
 
 --------
 
